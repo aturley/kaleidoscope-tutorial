@@ -1,23 +1,28 @@
-#include <cstdlib>
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/Passes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Scalar.h"
+#include <cctype>
+#include <cstdio>
+#include <map>
 #include <string>
 #include <vector>
-#include <map>
-#include <llvm/ADT/STLExtras.h>
-#include <llvm/IR/Value.h>
-#include <llvm/IR/Module.h>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/LLVMContext.h>
-#include <llvm/IR/Type.h>
-#include <llvm/IR/Function.h>
-#include <llvm/IR/BasicBlock.h>
-#include <llvm/IR/Verifier.h>
+#include "../include/KaleidoscopeJIT.h"
 
 static llvm::LLVMContext TheContext;
 static std::unique_ptr<llvm::Module> TheModule;
 static llvm::IRBuilder<> Builder(TheContext);
 static std::map<std::string, llvm::Value*> NamedValues;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
 
 llvm::Value *LogErrorV(const char *Str);
+static void InitializeModuleAndPassManager();
 
 enum Token {
   tok_eof = -1,
@@ -80,6 +85,7 @@ static int gettok() {
   LastChar = getchar();
   return ThisChar;
 }
+llvm::Function *getFunction(std::string Name);
 
 class ExprAST {
 public:
@@ -156,7 +162,7 @@ public:
 };
 
 llvm::Value *CallExprAST::codegen() {
-  llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  llvm::Function *CalleeF = getFunction(Callee);
   if (!CalleeF) {
     return LogErrorV("Unknown function referenced");
   }
@@ -202,6 +208,8 @@ llvm::Function *PrototypeAST::codegen() {
   return F;
 }
 
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
 class FunctionAST: public ExprAST {
   std::unique_ptr<PrototypeAST> Proto;
   std::unique_ptr<ExprAST> Body;
@@ -213,31 +221,13 @@ public:
 };
 
 llvm::Function *FunctionAST::codegen() {
-  llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-  if (!TheFunction) {
-    TheFunction = Proto->codegen();
-  } else {
-    // compare the args
-    std::vector<std::string> TheFunctionArgs;
-
-    for(auto &Arg : TheFunction->args()) {
-      TheFunctionArgs.push_back(Arg.getName());
-    }
-
-    if (TheFunctionArgs != Proto->getArgs()) {
-      return (llvm::Function*) LogErrorV("Prototype args don't match function args");
-    }
-  }
-
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  llvm::Function *TheFunction = getFunction(P.getName());
   if (!TheFunction) {
     return nullptr;
   }
-
-  if (!TheFunction->empty()) {
-    return (llvm::Function*) LogErrorV("Function cannot be redefined");
-  }
-
+  
   llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", TheFunction);
   Builder.SetInsertPoint(BB);
 
@@ -249,10 +239,24 @@ llvm::Function *FunctionAST::codegen() {
   if (llvm::Value *RetVal = Body->codegen()) {
     Builder.CreateRet(RetVal);
     verifyFunction(*TheFunction);
+    TheFPM->run(*TheFunction);
     return TheFunction;
   }
 
   TheFunction->eraseFromParent();
+  return nullptr;
+}
+
+llvm::Function *getFunction(std::string Name) {
+  if (auto *F = TheModule->getFunction(Name)) {
+    return F;
+  }
+
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end()) {
+    return FI->second->codegen();
+  }
+
   return nullptr;
 }
 
@@ -446,17 +450,32 @@ static std::unique_ptr<PrototypeAST> ParseExtern() {
 
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
   if (auto E = ParseExpression()) {
-    auto Proto = llvm::make_unique<PrototypeAST>("", std::vector<std::string>());
+    auto Proto = llvm::make_unique<PrototypeAST>("__anon_expr", std::vector<std::string>());
     return llvm::make_unique<FunctionAST>(std::move(Proto), std::move(E));
   }
   return nullptr;
 }
 
+static void InitializeModuleAndPassManager() {
+  TheModule = llvm::make_unique<llvm::Module>("my lonely module jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+
+  TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+  TheFPM->add(llvm::createInstructionCombiningPass());
+  TheFPM->add(llvm::createReassociatePass());
+  TheFPM->add(llvm::createGVNPass());
+  TheFPM->add(llvm::createCFGSimplificationPass());
+
+  TheFPM->doInitialization();
+}
+
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Parsed a function definition\n");
+      fprintf(stderr, "Read function definition:\n");
       FnIR->dump();
+      TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
     }
   } else {
     getNextToken();
@@ -466,8 +485,9 @@ static void HandleDefinition() {
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
     if (auto *FnIR = ProtoAST->codegen()) {
-      fprintf(stderr, "Parsed an extern\n");
+      fprintf(stderr, "Read extern:\n");
       FnIR->dump();
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     getNextToken();
@@ -479,6 +499,17 @@ static void HandleTopLevelExpression() {
     if (auto *FnIR = FnAST->codegen()) {
       fprintf(stderr, "Parsed a top-level expression\n");
       FnIR->dump();
+
+      auto H = TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
+
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      TheJIT->removeModule(H);
     }
   } else {
     getNextToken();
@@ -508,6 +539,10 @@ static void MainLoop() {
 }
 
 int main() {
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 30;
@@ -516,11 +551,17 @@ int main() {
   fprintf(stderr, "ready >");
   getNextToken();
 
-  TheModule = llvm::make_unique<llvm::Module>("my lonely jit", TheContext);
+  TheJIT = llvm::make_unique<llvm::orc::KaleidoscopeJIT>();
+  InitializeModuleAndPassManager();
 
   MainLoop();
 
   TheModule->dump();
 
+  return 0;
+}
+
+extern "C" double putchard(double X) {
+  fputc((char)X, stderr);
   return 0;
 }
