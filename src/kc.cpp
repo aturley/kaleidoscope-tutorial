@@ -30,6 +30,9 @@ enum Token {
   tok_extern = -3,
   tok_identifier = -4,
   tok_number = -5,
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
 };
 
 static std::string IdentifierStr;
@@ -52,6 +55,15 @@ static int gettok() {
     }
     if (IdentifierStr == "extern") {
       return tok_extern;
+    }
+    if (IdentifierStr == "if") {
+      return tok_if;
+    }
+    if (IdentifierStr == "then") {
+      return tok_then;
+    }
+    if (IdentifierStr == "else") {
+      return tok_else;
     }
     return tok_identifier;
   }
@@ -247,6 +259,60 @@ llvm::Function *FunctionAST::codegen() {
   return nullptr;
 }
 
+class IfExprAST: public ExprAST {
+  std::unique_ptr<ExprAST> Cond, Then, Else;
+public:
+  IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then, std::unique_ptr<ExprAST> Else):
+    Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {};
+  virtual llvm::Value *codegen();
+};
+
+llvm::Value *IfExprAST::codegen() {
+  llvm::Value *CondV = Cond->codegen();
+  if (!CondV) {
+    return nullptr;
+  }
+
+  CondV = Builder.CreateFCmpONE(CondV, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "ifcond");
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+
+  llvm::BasicBlock *ThenBB = llvm::BasicBlock::Create(TheContext, "then", TheFunction);
+  llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(TheContext, "else");
+  llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(TheContext, "ifcont");
+
+  Builder.CreateCondBr(CondV, ThenBB, ElseBB);
+
+  Builder.SetInsertPoint(ThenBB);
+
+  llvm::Value *ThenV = Then->codegen();
+  if (!ThenV) {
+    return nullptr;
+  }
+
+  Builder.CreateBr(MergeBB);
+
+  ThenBB = Builder.GetInsertBlock();
+  TheFunction->getBasicBlockList().push_back(ElseBB);
+  Builder.SetInsertPoint(ElseBB);
+
+  llvm::Value *ElseV = Else->codegen();
+  if (!ElseV) {
+    return nullptr;
+  }
+
+  Builder.CreateBr(MergeBB);
+
+  ElseBB = Builder.GetInsertBlock();
+
+  TheFunction->getBasicBlockList().push_back(MergeBB);
+  Builder.SetInsertPoint(MergeBB);
+  llvm::PHINode *PN = Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, "iftmp");
+
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
 llvm::Function *getFunction(std::string Name) {
   if (auto *F = TheModule->getFunction(Name)) {
     return F;
@@ -337,9 +403,12 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return llvm::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+static std::unique_ptr<ExprAST> ParseIfExpr();
+
 static std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
   default:
+    printf("unknown token: %d\n", CurTok);
     return LogError("unknown token while parsing expression");
   case tok_identifier:
     return ParseIdentifierExpr();
@@ -347,6 +416,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
   }
 }
 
@@ -446,6 +517,37 @@ static std::unique_ptr<FunctionAST> ParseDefinition() {
 static std::unique_ptr<PrototypeAST> ParseExtern() {
   getNextToken(); // eat 'extern'
   return ParsePrototype();
+}
+
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken();
+
+  auto Cond = ParseExpression();
+  if (!Cond) {
+    return nullptr;
+  }
+
+  if (CurTok != tok_then) {
+    return LogError("expected then");
+  }
+  getNextToken();
+
+  auto Then = ParseExpression();
+  if (!Then) {
+    return nullptr;
+  }
+
+  if (CurTok != tok_else) {
+    return LogError("expected else");
+  }
+  getNextToken();
+
+  auto Else = ParseExpression();
+  if (!Else) {
+    return nullptr;
+  }
+
+  return llvm::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
 }
 
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
