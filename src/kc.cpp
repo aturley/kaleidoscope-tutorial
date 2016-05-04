@@ -33,6 +33,8 @@ enum Token {
   tok_if = -6,
   tok_then = -7,
   tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
 };
 
 static std::string IdentifierStr;
@@ -64,6 +66,12 @@ static int gettok() {
     }
     if (IdentifierStr == "else") {
       return tok_else;
+    }
+    if (IdentifierStr == "for") {
+      return tok_for;
+    }
+    if (IdentifierStr == "in") {
+      return tok_in;
     }
     return tok_identifier;
   }
@@ -313,6 +321,73 @@ llvm::Value *IfExprAST::codegen() {
   return PN;
 }
 
+class ForExprAST: public ExprAST {
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start, End, Step, Body;
+public:
+  ForExprAST(std::string &VarName, std::unique_ptr<ExprAST> Start, std::unique_ptr<ExprAST> End,
+             std::unique_ptr<ExprAST> Step, std::unique_ptr<ExprAST> Body):
+    VarName(VarName), Start(std::move(Start)), End(std::move(End)), Step(std::move(Step)), Body(std::move(Body)) {}
+  virtual llvm::Value *codegen();
+};
+
+llvm::Value *ForExprAST::codegen() {
+  llvm::Value *StartV = Start->codegen();
+  if (!StartV) {
+    return nullptr;
+  }
+
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  llvm::BasicBlock *PreheaderBB = Builder.GetInsertBlock();
+  llvm::BasicBlock *LoopBB = llvm::BasicBlock::Create(TheContext, "loop", TheFunction);
+
+  Builder.CreateBr(LoopBB);
+
+  Builder.SetInsertPoint(LoopBB);
+
+  llvm::PHINode *Variable = Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, VarName.c_str());
+  Variable->addIncoming(StartV, PreheaderBB);
+
+  llvm::Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  if (!Body->codegen()) {
+    return nullptr;
+  }
+
+  llvm::Value *StepV = nullptr;
+  if (Step) {
+    StepV = Step->codegen();
+    if (!StepV) {
+      return nullptr;
+    }
+  } else {
+    StepV = llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
+  }
+
+  llvm::Value *NextV = Builder.CreateFAdd(Variable, StepV, "nextvar");
+
+  llvm::Value *EndCond = End->codegen();
+  if (!EndCond) {
+    return nullptr;
+  }
+
+  EndCond = Builder.CreateFCmpONE(EndCond, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "loopcond");
+  llvm::BasicBlock *LoopEndBB = Builder.GetInsertBlock();
+  llvm::BasicBlock *AfterBB = llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
+  Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
+  Builder.SetInsertPoint(AfterBB);
+
+  Variable->addIncoming(NextV, LoopEndBB);
+  if (OldVal) {
+    NamedValues[VarName] = OldVal;
+  } else {
+    NamedValues.erase(VarName);
+  }
+
+  return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(TheContext));
+}
+
 llvm::Function *getFunction(std::string Name) {
   if (auto *F = TheModule->getFunction(Name)) {
     return F;
@@ -404,6 +479,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
 }
 
 static std::unique_ptr<ExprAST> ParseIfExpr();
+static std::unique_ptr<ExprAST> ParseForExpr();
 
 static std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
@@ -418,6 +494,8 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseParenExpr();
   case tok_if:
     return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
   }
 }
 
@@ -548,6 +626,59 @@ static std::unique_ptr<ExprAST> ParseIfExpr() {
   }
 
   return llvm::make_unique<IfExprAST>(std::move(Cond), std::move(Then), std::move(Else));
+}
+
+static std::unique_ptr<ExprAST> ParseForExpr() {
+  getNextToken();
+
+  if (CurTok != tok_identifier) {
+    return LogError("Expected identifier after for");
+  }
+
+  std::string IdName = IdentifierStr;
+  getNextToken();
+
+  if (CurTok != '=') {
+    return LogError("Expected '=' after identifier");
+  }
+  getNextToken();
+
+  auto Start = ParseExpression();
+  if (!Start) {
+    return nullptr;
+  }
+
+  if (CurTok != ',') {
+    return LogError("Expected ',' after start value");
+  }
+  getNextToken();
+
+  auto End = ParseExpression();
+  if (!End) {
+    return nullptr;
+  }
+
+  std::unique_ptr<ExprAST> Step;
+  if (CurTok == ',') {
+    getNextToken();
+    Step = ParseExpression();
+    if (!Step) {
+      return nullptr;
+    }
+  }
+
+  if (CurTok != tok_in) {
+    LogError("Expected 'in' after for");
+  }
+
+  getNextToken();
+
+  auto Body = ParseExpression();
+  if (!Body) {
+    return nullptr;
+  }
+
+  return llvm::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End), std::move(Step), std::move(Body));
 }
 
 static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
